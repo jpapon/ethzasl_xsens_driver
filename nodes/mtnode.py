@@ -97,8 +97,10 @@ class XSensDriver(object):
 
         # publish a string version of all data; to be parsed by clients
         self.str_pub = rospy.Publisher('imu_data_str', String, queue_size=10)
-        self.last_delta_q_time = None
-        self.delta_q_rate = None
+
+        self.time_offset_secs = None
+        self.time_offset_nsecs = None
+
 
     def reset_vars(self):
         self.imu_msg = Imu()
@@ -533,52 +535,6 @@ class XSensDriver(object):
             '''Fill messages with information from 'Angular Velocity' MTData2
             block.'''
             try:
-                dqw, dqx, dqy, dqz = convert_quat(
-                    (o['Delta q0'], o['Delta q1'], o['Delta q2'],
-                     o['Delta q3']),
-                    o['frame'])
-                now = rospy.Time.now()
-                if self.last_delta_q_time is None:
-                    self.last_delta_q_time = now
-                else:
-                    # update rate (filtering needed to account for lag variance)
-                    delta_t = (now - self.last_delta_q_time).to_sec()
-                    if self.delta_q_rate is None:
-                        self.delta_q_rate = 1./delta_t
-                    delta_t_filtered = .95/self.delta_q_rate + .05*delta_t
-                    # rate in necessarily integer
-                    self.delta_q_rate = round(1./delta_t_filtered)
-                    print(delta_t, delta_t_filtered, self.delta_q_rate)
-                    self.last_delta_q_time = now
-                    # relationship between \Delta q and velocity \bm{\omega}:
-                    # \bm{w} = \Delta t . \bm{\omega}
-                    # \theta = |\bm{w}|
-                    # \Delta q = [cos{\theta/2}, sin{\theta/2)/\theta . \bm{\omega}
-                    # extract rotation angle over delta_t
-                    ca_2, sa_2 = dqw, sqrt(dqx**2 + dqy**2 + dqz**2)
-                    ca = ca_2**2 - sa_2**2
-                    sa = 2*ca_2*sa_2
-                    rotation_angle = atan2(sa, ca)
-                    # compute rotation velocity
-                    rotation_speed = rotation_angle * self.delta_q_rate
-                    f = rotation_speed / sa_2
-                    x, y, z = f*dqx, f*dqy, f*dqz
-                    self.imu_msg.angular_velocity.x = x
-                    self.imu_msg.angular_velocity.y = y
-                    self.imu_msg.angular_velocity.z = z
-                    self.imu_msg.angular_velocity_covariance = (
-                        radians(0.025), 0., 0.,
-                        0., radians(0.025), 0.,
-                        0., 0., radians(0.025))
-                    self.pub_imu = True
-                    self.vel_msg.twist.angular.x = x
-                    self.vel_msg.twist.angular.y = y
-                    self.vel_msg.twist.angular.z = z
-                    self.pub_vel = True
-                    print(x, y, z)
-            except KeyError:
-                pass
-            try:
                 x, y, z = convert_coords(o['gyrX'], o['gyrY'], o['gyrZ'],
                                          o['frame'])
                 self.imu_msg.angular_velocity.x = x
@@ -593,10 +549,9 @@ class XSensDriver(object):
                 self.vel_msg.twist.angular.y = y
                 self.vel_msg.twist.angular.z = z
                 self.pub_vel = True
-                print(x, y, z)
-                print
             except KeyError:
                 pass
+            # TODO decide what to do with 'Delta q'
 
         def fill_from_GPS(o):
             '''Fill messages with information from 'GPS' MTData2 block.'''
@@ -688,9 +643,34 @@ class XSensDriver(object):
         except mtdef.MTTimeoutException:
             time.sleep(0.1)
             return
+        #Grab the time from the time reference message, compare to now. 
+        if (self.time_offset_secs is None):
+            current_time = rospy.Time.now()
+            imu_msg_time =  data['Timestamp']['SampleTimeFine']
+            secs = int(100e-6 * imu_msg_time)  #Yes, this is weird, blame XSens
+            nsecs = 1e5 * imu_msg_time - 1e9 * secs           
+           
+            self.time_offset_secs = current_time.secs - secs
+            self.time_offset_nsecs = current_time.nsecs - nsecs
+            if (self.time_offset_nsecs < 0):
+                self.time_offset_nsecs += 1e9
+                self.time_offset_secs -= 1 
+
+            rospy.loginfo ("Time offset = {} secs {} nanosecs".format(self.time_offset_secs, self.time_offset_nsecs))
+
         # common header
         self.h = Header()
-        self.h.stamp = rospy.Time.now()
+        #current_time = rospy.Time.now()
+        imu_msg_time = data['Timestamp']['SampleTimeFine']
+        secs = int(100e-6 * imu_msg_time)  #Yes, this is weird, blame XSens
+        nsecs = 1e5 * imu_msg_time - 1e9 *secs
+
+        current_time_secs = self.time_offset_secs + secs
+        current_time_nsecs = self.time_offset_nsecs + nsecs
+        if (current_time_nsecs >= 1e9):
+            current_time_nsecs -= 1e9
+            current_time_secs += 1
+        self.h.stamp = rospy.Time(current_time_secs, current_time_nsecs)
         self.h.frame_id = self.frame_id
 
         # set default values
