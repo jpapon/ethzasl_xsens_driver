@@ -101,6 +101,7 @@ class XSensDriver(object):
         self.time_offset_secs = None
         self.time_offset_nsecs = None
 
+        self.last_time = rospy.Time.now()
 
     def reset_vars(self):
         self.imu_msg = Imu()
@@ -405,9 +406,12 @@ class XSensDriver(object):
             except KeyError:
                 pass
             try:
-                sample_time_fine = o['SampleTimeFine']
-                secs = int(sample_time_fine / 1000)
-                nsecs = 1e6 * (sample_time_fine % 1000)
+                #sample_time_fine = o['SampleTimeFine']
+                #secs = int(sample_time_fine / 1000)
+                #nsecs = 1e6 * (sample_time_fine % 1000)
+                imu_msg_time = o['SampleTimeFine']
+                secs = int(100e-6 * imu_msg_time)  #Yes, this is weird, blame XSens
+                nsecs = 1e5 * imu_msg_time - 1e9 *secs
                 publish_time_ref(secs, nsecs, 'sample time fine')
             except KeyError:
                 pass
@@ -418,6 +422,7 @@ class XSensDriver(object):
                 pass
             # TODO find what to do with other kind of information
             pass
+            
 
         def fill_from_Orientation_Data(o):
             '''Fill messages with information from 'Orientation Data' MTData2
@@ -641,35 +646,49 @@ class XSensDriver(object):
         try:
             data = self.mt.read_measurement()
         except mtdef.MTTimeoutException:
+            rospy.logwarn ("TIMEOUT!")
             time.sleep(0.1)
             return
+        
         #Grab the time from the time reference message, compare to now. 
         if (self.time_offset_secs is None):
             current_time = rospy.Time.now()
             imu_msg_time =  data['Timestamp']['SampleTimeFine']
             secs = int(100e-6 * imu_msg_time)  #Yes, this is weird, blame XSens
-            nsecs = 1e5 * imu_msg_time - 1e9 * secs           
+            nsecs = 1e5 * imu_msg_time - 1e9 * secs          
            
             self.time_offset_secs = current_time.secs - secs
             self.time_offset_nsecs = current_time.nsecs - nsecs
             if (self.time_offset_nsecs < 0):
                 self.time_offset_nsecs += 1e9
                 self.time_offset_secs -= 1 
+            #rospy.loginfo ("New Time offset = {} secs {} nanosecs".format(self.time_offset_secs, self.time_offset_nsecs))
 
-            rospy.loginfo ("Time offset = {} secs {} nanosecs".format(self.time_offset_secs, self.time_offset_nsecs))
-
-        # common header
-        self.h = Header()
-        #current_time = rospy.Time.now()
+        current_time = rospy.Time.now()
         imu_msg_time = data['Timestamp']['SampleTimeFine']
         secs = int(100e-6 * imu_msg_time)  #Yes, this is weird, blame XSens
         nsecs = 1e5 * imu_msg_time - 1e9 *secs
-
         current_time_secs = self.time_offset_secs + secs
         current_time_nsecs = self.time_offset_nsecs + nsecs
+        
         if (current_time_nsecs >= 1e9):
             current_time_nsecs -= 1e9
             current_time_secs += 1
+            
+        #Check if we've drifted too far - if so, reset time offset - it will be set on next message
+        MAX_TIME_DELTA = 1e8         #Nanoseconds
+        time_delta = abs((current_time_nsecs - current_time.nsecs) + (current_time_secs - current_time.secs)*1e9)
+        if ( time_delta > MAX_TIME_DELTA):
+            self.time_offset_secs = self.time_offset_nsecs = None
+            rospy.logwarn ("Time delta {} between IMU and ROS has drifted too far, resetting!".format(time_delta))
+            #Sleep so we never go backwards in time!
+            rospy.sleep(MAX_TIME_DELTA * 1e-9)
+            self.mt.device.flushInput()    # flush to make sure the port is ready
+            self.mt.device.flushOutput()    # flush to make sure the port is ready
+            return
+
+        # common header
+        self.h = Header()
         self.h.stamp = rospy.Time(current_time_secs, current_time_nsecs)
         self.h.frame_id = self.frame_id
 
@@ -689,6 +708,12 @@ class XSensDriver(object):
             if self.imu_pub is None:
                 self.imu_pub = rospy.Publisher('imu/data', Imu, queue_size=10)
             self.imu_pub.publish(self.imu_msg)
+        
+        if self.pub_mag:
+            self.mag_msg.header = self.h
+            if self.mag_pub is None:
+                self.mag_pub = rospy.Publisher('imu/mag', MagneticField,
+                                               queue_size=10)
         if self.pub_gps:
             self.gps_msg.header = self.h
             if self.gps_pub is None:
@@ -742,7 +767,6 @@ class XSensDriver(object):
             self.diag_pub.publish(self.diag_msg)
         # publish string representation
         self.str_pub.publish(str(data))
-
 
 def main():
     '''Create a ROS node and instantiate the class.'''
